@@ -5,3 +5,6 @@ venv/
 .env
 .pytest_cache/
 *.egg-info/
+run.log
+run-full.log
+data/last-run.png

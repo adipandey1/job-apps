@@ -89,11 +89,28 @@ def fill_candidates(key: str, value: str) -> list[str]:
     elif key in {"specialization", "field_of_study"}:
         for part in value.replace("/", ",").split(","):
             add(part.strip())
-        if "artificial intelligence" in value.casefold():
+        v = value.casefold()
+        if "artificial intelligence" in v:
             add("Artificial Intelligence", "AI", "Machine Learning")
-        if "data science" in value.casefold():
+        if "data science" in v:
             add("Data Science", "Analytics")
-        add("Computer Science", "CS")
+        # Only add a field-of-study fallback when it's actually relevant to the
+        # profile's specialization — a blanket "Computer Science" fallback here
+        # would cause the wrong dropdown option to be picked for every other
+        # field of study (e.g. Information Technology Management, Biology).
+        if "computer science" in v:
+            add("Computer Science", "CS")
+        if "information technology" in v:
+            add(
+                "Information Technology",
+                "Information Technology Management",
+                "Computer Information Systems",
+                "Management Information Systems",
+                "MIS",
+                "IT",
+            )
+        if "biology" in v:
+            add("Biology", "Biological Sciences", "Life Sciences")
     elif key == "source":
         v = value.casefold()
         if "linkedin" in v:

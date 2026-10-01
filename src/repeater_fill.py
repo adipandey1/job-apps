@@ -26,13 +26,21 @@ WORK_ADD_KEYWORDS = (
     "add job",
     "add another position",
     "add position",
+    "add another",
 )
 EDUCATION_ADD_KEYWORDS = (
     "add education",
     "add school",
     "add degree",
     "add another education",
+    "add another",
 )
+
+# Fields where resume-parser autofill routinely truncates or half-fills values
+# (e.g. "Director" instead of "Director Data Science and Analytics"). For these
+# keys we only skip re-filling when the on-page value is an EXACT match to the
+# canonical profile value — a loose substring match is not good enough.
+STRICT_MATCH_KEYS = frozenset({"title", "company", "description", "school", "specialization"})
 
 
 def normalize_value(value: str) -> str:
@@ -47,26 +55,69 @@ def values_match(expected: str, actual: str) -> bool:
     return a == b or a in b or b in a
 
 
-def entry_already_on_page(
+def find_matching_block_index(
     entry: dict,
     primary_values: list[str],
     secondary_values: list[str],
     primary_key: str,
     secondary_key: str,
-) -> bool:
-    """True if resume autofill (or a prior pass) already has this entry."""
+    exclude: frozenset[int] = frozenset(),
+) -> int | None:
+    """Return the page-block index that already represents this profile entry
+    (resume autofill or a prior pass), or None if no block matches.
+
+    Matching is position-independent by design: it never assumes block N on
+    the page corresponds to entry N in the profile, because resume parsers
+    frequently drop an entry's primary field (e.g. leave Company blank) which
+    would otherwise desync the two orderings.
+    """
     primary = str(entry.get(primary_key, "") or "")
     secondary = str(entry.get(secondary_key, "") or "")
-    if not primary:
-        return False
 
+    # Prefer matching by the primary identifier (company/school) when present.
     for index, on_page_primary in enumerate(primary_values):
-        if not values_match(primary, on_page_primary):
+        if index in exclude:
+            continue
+        if not (on_page_primary and primary and values_match(primary, on_page_primary)):
             continue
         on_page_secondary = secondary_values[index] if index < len(secondary_values) else ""
         if not secondary or not on_page_secondary or values_match(secondary, on_page_secondary):
-            return True
-    return False
+            return index
+
+    # Fall back to matching by the secondary identifier alone (title/degree) for
+    # blocks where the resume parser left the primary field blank but still
+    # captured the title — only for blocks whose primary field is still blank,
+    # so we never steal a block that legitimately belongs to another entry.
+    if secondary:
+        for index, on_page_secondary in enumerate(secondary_values):
+            if index in exclude or not on_page_secondary:
+                continue
+            on_page_primary = primary_values[index] if index < len(primary_values) else ""
+            if on_page_primary:
+                continue
+            if values_match(secondary, on_page_secondary):
+                return index
+
+    return None
+
+
+def find_empty_block_index(
+    primary_values: list[str],
+    secondary_values: list[str],
+    exclude: frozenset[int] = frozenset(),
+) -> int | None:
+    """An existing block where neither identifying field has any value yet —
+    safe to claim for a new entry (e.g. the default starter block on a fresh
+    form) without risking overwriting another entry's data."""
+    total = max(len(primary_values), len(secondary_values))
+    for index in range(total):
+        if index in exclude:
+            continue
+        on_page_primary = primary_values[index] if index < len(primary_values) else ""
+        on_page_secondary = secondary_values[index] if index < len(secondary_values) else ""
+        if not on_page_primary.strip() and not on_page_secondary.strip():
+            return index
+    return None
 
 
 async def read_button_label(element: Locator) -> str:
@@ -82,9 +133,31 @@ async def read_button_label(element: Locator) -> str:
     return (aria or "").strip()
 
 
-async def click_add_button(page: Page, keywords: tuple[str, ...]) -> bool:
+async def click_add_button(
+    page: Page,
+    keywords: tuple[str, ...],
+    section_label: str | None = None,
+) -> bool:
     from src.filler import safe_count
 
+    # Scope to the specific section's group first — Workday forms commonly label
+    # every repeater's add button just "Add"/"Add Another" with no section-specific
+    # text, so an unscoped page-wide search can click the WRONG section's button
+    # (e.g. add another Work Experience block while trying to add Education).
+    if section_label:
+        group = page.get_by_role("group", name=section_label, exact=True).first
+        try:
+            if await safe_count(group) > 0:
+                add_btn = group.get_by_role("button", name=re.compile(r"^add\b", re.IGNORECASE))
+                if await safe_count(add_btn) > 0:
+                    await add_btn.first.scroll_into_view_if_needed()
+                    await add_btn.first.click()
+                    await page.wait_for_timeout(1500)
+                    return True
+        except Exception:
+            pass
+
+    # Fallback: page-wide keyword search (older/differently-structured forms).
     selectors = ["button:visible", "a:visible", "[role=button]:visible", "input[type=button]:visible"]
     for selector in selectors:
         count = await safe_count(page.locator(selector))
@@ -183,9 +256,12 @@ async def get_filled_field_values(
             if key != field_key:
                 continue
 
+            # Always append (even "") to keep this list positionally aligned with
+            # the other field's value list — one entry per block in DOM order.
+            # Filtering out blanks here would desync primary/secondary indices
+            # whenever a block has one field filled and the other left blank.
             value = await read_element_value(element)
-            if value.strip():
-                values.append(value.strip())
+            values.append(value.strip())
         except Exception:
             continue
 
@@ -268,8 +344,15 @@ async def fill_entry_fields(
 
             if key != "current":
                 current = await read_element_value(element)
-                if current.strip() and values_match(str(value), current):
-                    continue
+                if current.strip():
+                    if key in STRICT_MATCH_KEYS:
+                        # Resume parsers routinely truncate these (e.g. "Director"
+                        # instead of "Director Data Science and Analytics") — only
+                        # skip when it's already an exact match to the canonical value.
+                        if normalize_value(current) == normalize_value(str(value)):
+                            continue
+                    elif values_match(str(value), current):
+                        continue
 
             field_key = f"{section}[{entry_index}].{key}"
             if key == "current":
@@ -303,6 +386,7 @@ async def fill_repeater_section(
     add_keywords: tuple[str, ...],
     primary_key: str,
     secondary_key: str,
+    group_label: str | None = None,
 ) -> tuple[list[Action], list[Action]]:
     entries = profile.get(section, [])
     if not entries:
@@ -313,50 +397,47 @@ async def fill_repeater_section(
 
     filled: list[Action] = []
     skipped: list[Action] = []
+    claimed_blocks: set[int] = set()
 
-    for index, entry in enumerate(entries):
+    for entry in entries:
         primary_values = await get_filled_field_values(page, map_func, primary_key)
         secondary_values = await get_filled_field_values(page, map_func, secondary_key)
 
-        if entry_already_on_page(entry, primary_values, secondary_values, primary_key, secondary_key):
-            label = f"{entry.get(primary_key, '')} / {entry.get(secondary_key, '')}".strip(" /")
-            filled.append(
-                {
-                    "label": label,
-                    "key": f"{section}[{index}]",
-                    "value": "skipped — already on page",
-                }
+        block_index = find_matching_block_index(
+            entry, primary_values, secondary_values, primary_key, secondary_key,
+            exclude=frozenset(claimed_blocks),
+        )
+
+        if block_index is None:
+            # No block represents this entry yet. Reuse an untouched empty block
+            # (e.g. the default starter block on a fresh form) before creating a
+            # new one — never guess by position, which risks overwriting a
+            # different entry's data (e.g. after a block was deleted, leaving a
+            # gap that doesn't line up with profile order anymore).
+            block_index = find_empty_block_index(
+                primary_values, secondary_values, exclude=frozenset(claimed_blocks)
             )
-            continue
 
-        blocks_on_page = len(primary_values)
+        if block_index is None:
+            added = await click_add_button(page, add_keywords, section_label=group_label)
+            if not added:
+                skipped.append(
+                    {
+                        "label": f"{entry.get(primary_key, '')} / {entry.get(secondary_key, '')}".strip(" /"),
+                        "key": section,
+                        "error": "could not find Add button for new entry",
+                    }
+                )
+                continue
+            primary_values = await get_filled_field_values(page, map_func, primary_key)
+            block_index = len(primary_values) - 1 if primary_values else 0
 
-        if blocks_on_page > index:
-            part_filled, part_skipped = await fill_entry_fields(
-                page, entry, map_func, value_func, section, index
-            )
-            filled.extend(part_filled)
-            skipped.extend(part_skipped)
-            continue
-
-        if blocks_on_page == index:
-            if index > 0:
-                added = await click_add_button(page, add_keywords)
-                if not added:
-                    skipped.append(
-                        {
-                            "label": section,
-                            "key": section,
-                            "error": f"could not find Add button for entry {index + 1}",
-                        }
-                    )
-                    break
-
-            part_filled, part_skipped = await fill_entry_fields(
-                page, entry, map_func, value_func, section, index
-            )
-            filled.extend(part_filled)
-            skipped.extend(part_skipped)
+        claimed_blocks.add(block_index)
+        part_filled, part_skipped = await fill_entry_fields(
+            page, entry, map_func, value_func, section, block_index
+        )
+        filled.extend(part_filled)
+        skipped.extend(part_skipped)
 
     return filled, skipped
 
@@ -371,6 +452,7 @@ async def fill_work_history(page: Page, profile: dict) -> tuple[list[Action], li
         WORK_ADD_KEYWORDS,
         primary_key="company",
         secondary_key="title",
+        group_label="Work Experience",
     )
 
 
@@ -384,4 +466,5 @@ async def fill_education(page: Page, profile: dict) -> tuple[list[Action], list[
         EDUCATION_ADD_KEYWORDS,
         primary_key="school",
         secondary_key="degree",
+        group_label="Education",
     )

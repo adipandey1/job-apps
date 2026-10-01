@@ -19,6 +19,29 @@ def test_state_candidates():
     assert "Texas" in candidates
 
 
+def test_specialization_no_blanket_computer_science_fallback():
+    # Regression test: specialization candidates must not include an unrelated
+    # "Computer Science" fallback for fields of study that have nothing to do
+    # with it (this previously caused wrong dropdown-option selection).
+    candidates = fill_candidates("specialization", "Information Technology Management")
+    assert "Computer Science" not in candidates
+    assert "CS" not in candidates
+    assert "Information Technology Management" in candidates
+    assert "Management Information Systems" in candidates
+
+
+def test_specialization_biology_candidates():
+    candidates = fill_candidates("specialization", "Biology, Minor in Information Technology and Systems")
+    assert "Biology" in candidates
+    assert "Computer Science" not in candidates
+
+
+def test_specialization_computer_science_still_matches_when_relevant():
+    candidates = fill_candidates("specialization", "Computer Science")
+    assert "Computer Science" in candidates
+    assert "CS" in candidates
+
+
 def test_pick_option_exact():
     options = [("", "Select..."), ("US", "United States"), ("CA", "Canada")]
     match = pick_option(options, ["United States"])

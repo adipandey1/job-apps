@@ -1,4 +1,5 @@
 import asyncio
+import re
 
 from playwright.async_api import Locator, Page
 
@@ -26,7 +27,8 @@ LATE_CONTACT_ORDER = {
 }
 TEXT_INPUT_SELECTOR = (
     "input:not([type=radio]):not([type=checkbox]):not([type=hidden]):not([type=submit]):"
-    "not([type=button]):not([type=file]):visible, textarea:visible"
+    "not([type=button]):not([type=file]):not([name='website']):not([name*='honeypot' i]):"
+    "visible, textarea:visible"
 )
 DROPDOWN_SELECTOR = (
     "select:visible, [role=combobox]:visible, [aria-haspopup=listbox]:visible, "
@@ -59,6 +61,17 @@ async def safe_evaluate(element: Locator, expression: str, arg=None):
         return await element.evaluate(expression, arg, timeout=FIELD_TIMEOUT_MS)
     except Exception:
         return None
+
+
+async def is_honeypot_field(element: Locator) -> bool:
+    """Bot-trap fields (e.g. Workday's hidden 'website' field) must never be filled."""
+    name = (await safe_attr(element, "name") or "").casefold()
+    if "website" in name or "honeypot" in name:
+        return True
+    aria_label = (await safe_attr(element, "aria-label") or "").casefold()
+    if "robots only" in aria_label or "do not enter if you" in aria_label:
+        return True
+    return False
 
 
 def is_weak_label(label: str) -> bool:
@@ -336,6 +349,50 @@ async def fill_text_field(
     return value
 
 
+async def try_fill_searchable_combobox(
+    page: Page,
+    element: Locator,
+    mapping: FieldMapping,
+    value: str,
+) -> str | None:
+    """Some Workday fields look like plain text inputs but open a listbox of
+    selectable options on click/focus (e.g. "How Did You Hear About Us?").
+    Typing raw text into them doesn't register a selection and leaves the
+    field invalid. Detect this behavior dynamically and click the matching
+    option instead. Returns None if the field is a normal text input."""
+    from src.dropdown_fill import candidates_for_field, pick_from_visible_options
+
+    try:
+        await element.click(timeout=FIELD_TIMEOUT_MS)
+    except Exception:
+        return None
+    await page.wait_for_timeout(300)
+
+    option_locator = page.locator("[role=listbox]:visible [role=option]:visible, [role=option]:visible")
+    if await safe_count(option_locator) == 0:
+        return None
+
+    candidates = candidates_for_field(mapping.key, value)
+    picked = await pick_from_visible_options(page, candidates, key=mapping.key, profile_value=value)
+    if picked:
+        return picked
+
+    try:
+        await element.press_sequentially(value, delay=25)
+        await page.wait_for_timeout(300)
+        picked = await pick_from_visible_options(page, candidates, key=mapping.key, profile_value=value)
+        if picked:
+            return picked
+    except Exception:
+        pass
+
+    try:
+        await page.keyboard.press("Escape")
+    except Exception:
+        pass
+    return None
+
+
 async def fill_input_or_select(
     page: Page,
     element: Locator,
@@ -345,6 +402,11 @@ async def fill_input_or_select(
     tag = await element.evaluate("el => el.tagName.toLowerCase()")
     if tag == "select":
         return await fill_select_field(element, mapping, value)
+
+    picked = await try_fill_searchable_combobox(page, element, mapping, value)
+    if picked is not None:
+        return picked
+
     await fill_text_field(page, element, value)
     return value
 
@@ -358,6 +420,9 @@ async def fill_text_and_select_fields(page: Page, profile: dict) -> tuple[list[A
         element = page.locator(TEXT_INPUT_SELECTOR).nth(i)
         try:
             if not await safe_count(element):
+                continue
+
+            if await is_honeypot_field(element):
                 continue
 
             input_type = (await safe_attr(element, "type") or "").lower()
@@ -706,6 +771,9 @@ async def find_late_contact_elements(page: Page) -> list[tuple[str, str, str, Lo
     for i in range(count):
         element = page.locator(TEXT_INPUT_SELECTOR).nth(i)
         try:
+            if await is_honeypot_field(element):
+                continue
+
             input_type = (await safe_attr(element, "type") or "").lower()
             if input_type in {"hidden", "checkbox", "radio", "file"}:
                 continue
@@ -723,6 +791,8 @@ async def find_late_contact_elements(page: Page) -> list[tuple[str, str, str, Lo
     for i in range(email_count):
         element = page.locator(EMAIL_INPUT_SELECTOR).nth(i)
         try:
+            if await is_honeypot_field(element):
+                continue
             input_type = (await safe_attr(element, "type") or "").lower()
             if input_type in {"hidden", "checkbox", "radio", "file"}:
                 continue
@@ -881,12 +951,105 @@ def merge_results(*results: tuple[list[Action], list[Action]]) -> tuple[list[Act
     return filled, skipped
 
 
+async def find_skills_input(page: Page) -> Locator | None:
+    """Locate a Workday-style 'Type to Add Skills' search input. Generic lookup:
+    any visible Search-placeholder input whose accessible name mentions 'skill'."""
+    candidates = page.locator("input[placeholder='Search']:visible")
+    count = await safe_count(candidates)
+    for i in range(count):
+        element = candidates.nth(i)
+        try:
+            label = await accessible_name(page, element)
+        except Exception:
+            continue
+        if label and "skill" in label.casefold():
+            return element
+    return None
+
+
+def normalize_skill_text(text: str) -> str:
+    """Strip Workday's '(Suggested)' annotation and 'press delete to clear value' hint."""
+    text = re.sub(r",?\s*press delete to clear value\.?$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*\(suggested\)\s*$", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+async def read_selected_items_for_field(field: Locator) -> list[str]:
+    """Read the widget's own 'already selected' tag list, which lives in a
+    near-ancestor [role=listbox][aria-label*='items selected'] element — distinct
+    from the global options popup, which renders elsewhere (often body-level)."""
+    try:
+        texts = await field.evaluate(
+            """
+            (el) => {
+                let node = el;
+                for (let i = 0; i < 6 && node; i++) {
+                    node = node.parentElement;
+                    if (!node) break;
+                    const listbox = node.querySelector('[role="listbox"][aria-label*="items selected" i]');
+                    if (listbox) {
+                        return Array.from(listbox.querySelectorAll('[role="option"]'))
+                            .map((o) => o.textContent || '');
+                    }
+                }
+                return [];
+            }
+            """
+        )
+        return texts or []
+    except Exception:
+        return []
+
+
+async def fill_skills_field(page: Page, profile: dict) -> tuple[list[Action], list[Action]]:
+    """Fill a Workday-style 'Type to Add Skills' multi-add combobox with every
+    skill from the profile: for each skill not already selected, type it and
+    click the matching suggestion if one appears in the dropdown, otherwise
+    press Enter to add it as free text. No-ops if no skills widget is present."""
+    filled: list[Action] = []
+    skipped: list[Action] = []
+
+    skills = profile.get("skills", [])
+    if not skills:
+        return filled, skipped
+
+    field = await find_skills_input(page)
+    if field is None:
+        return filled, skipped
+
+    from src.dropdown_fill import pick_from_visible_options
+
+    existing_raw = await read_selected_items_for_field(field)
+    existing = {normalize_skill_text(t).casefold() for t in existing_raw}
+
+    for skill in skills:
+        skill_cf = skill.casefold()
+        if skill_cf in existing or any(skill_cf in e or e in skill_cf for e in existing):
+            continue
+        try:
+            await field.click(timeout=FIELD_TIMEOUT_MS)
+            await field.fill(skill)
+            await page.wait_for_timeout(500)
+
+            picked = await pick_from_visible_options(page, [skill], key="skills", profile_value=skill)
+            if not picked:
+                await field.press("Enter")
+                await page.wait_for_timeout(300)
+
+            existing.add(skill_cf)
+            filled.append({"label": "Skills", "key": "skills", "value": skill})
+        except Exception as exc:
+            skipped.append({"label": "Skills", "key": "skills", "error": f"{skill}: {exc}"})
+
+    return filled, skipped
+
+
 async def fill_form_fields(
     page: Page,
     profile: dict,
     job_description: str = "",
 ) -> tuple[list[Action], list[Action]]:
-    """Fill contact, screening, work history, education, and LLM essay fields."""
+    """Fill contact, screening, work history, education, skills, and LLM essay fields."""
     from src.repeater_fill import fill_education, fill_work_history
 
     return merge_results(
@@ -896,6 +1059,7 @@ async def fill_form_fields(
         await fill_custom_dropdowns(page, profile),
         await fill_work_history(page, profile),
         await fill_education(page, profile),
+        await fill_skills_field(page, profile),
         await fill_essay_fields(page, profile, job_description=job_description),
         await fill_late_contact_fields(page, profile),
     )

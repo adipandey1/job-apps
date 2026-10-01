@@ -114,7 +114,7 @@ def map_label_to_field(label: str) -> FieldMapping | None:
     ):
         return FieldMapping("screening", "related_to_employee")
 
-    if any(keyword in text for keyword in ("affiliate", "subsidiary", "dealer")) and "employ" in text:
+    if any(keyword in text for keyword in ("affiliate", "subsidiar", "dealer")) and "employ" in text:
         return FieldMapping("screening", "employed_by_parent_company")
     if "ever been employed by" in text or ("employed by" in text and "entity" in text):
         return FieldMapping("screening", "employed_by_parent_company")
@@ -124,6 +124,13 @@ def map_label_to_field(label: str) -> FieldMapping | None:
     if "previously worked" in text or ("worked" in text and ("before" in text or "here" in text)):
         return FieldMapping("screening", "worked_here_before")
     if "ever been employed" in text:
+        return FieldMapping("screening", "worked_here_before")
+    # e.g. "Have you ever worked for The Coca-Cola Company or any of its
+    # subsidiaries or Bottling partners?" — generic employer-history phrasing
+    # that doesn't say "before"/"here" but still asks about past employment.
+    if "worked for" in text and any(
+        keyword in text for keyword in ("subsidiar", "affiliate", "bottling", "parent compan", "company")
+    ):
         return FieldMapping("screening", "worked_here_before")
 
     if ("authorized" in text or "authoris" in text or "authoriz" in text or "eligib" in text) and (
